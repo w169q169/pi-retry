@@ -24,7 +24,7 @@ const success = { role: "assistant", stopReason: "stop", content: [{ type: "text
 beforeEach(() => { vi.useFakeTimers(); vi.resetModules(); });
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
-async function setup() {
+async function setup(captureAgent = false) {
   const handlers: Record<string, Function[]> = {};
   const sendMessage = vi.fn();
   const api = {
@@ -39,20 +39,31 @@ async function setup() {
     mode: "rpc", ui: { notify: vi.fn() }, signal: controller.signal,
     sessionManager: { getEntries: () => [{ type: "message", message }] },
   } as unknown as ExtensionContext;
+  const { Agent } = await import("@earendil-works/pi-agent-core");
+  vi.spyOn(Agent.prototype, "subscribe");
   const { default: extension } = await import("../../retry.ts");
   extension(api);
+  const agent = {
+    state: { messages: [error()] as object[] },
+    waitForIdle: vi.fn().mockResolvedValue(undefined),
+  };
+  if (captureAgent) {
+    Agent.prototype.subscribe.call(agent, vi.fn());
+    sendMessage.mockImplementation(() => { agent.state.messages = [error()]; });
+  }
   async function fire(name: string, event = {}) {
     for (const handler of handlers[name] ?? []) await handler(event, ctx);
   }
   await fire("session_start");
-  return { sendMessage, controller, fire, async finish(next: object) {
+  return { sendMessage, controller, fire, agent, async finish(next: object) {
     message = next;
+    agent.state.messages = [next];
     await fire("turn_end", { message });
     await fire("agent_end", { messages: [message] });
   } };
 }
 
-describe("automatic server overload retry without a captured Agent", () => {
+describe("automatic server overload retry", () => {
   it("retries the exact error with backoff and stops after success", async () => {
     const fixture = await setup();
     await fixture.finish(error());
@@ -103,17 +114,46 @@ describe("automatic server overload retry without a captured Agent", () => {
     expect(fixture.sendMessage).not.toHaveBeenCalled();
   });
 
-  it("stops after the configured failures at maximum backoff", async () => {
-    const fixture = await setup();
-    const delays = [2000, 4000, 8000, 16000, 32000, 60000, 60000, 60000];
+  it.each([false, true])("continues beyond eight retries, then stops on success (captured Agent: %s)", async captureAgent => {
+    const fixture = await setup(captureAgent);
+    const delays = [2000, 4000, 8000, 16000, 32000, ...Array(7).fill(60000)];
     for (const [index, delay] of delays.entries()) {
-      await fixture.finish(error());
+      if (!captureAgent || index === 0) await fixture.finish(error());
       await vi.advanceTimersByTimeAsync(delay);
       expect(fixture.sendMessage).toHaveBeenCalledTimes(index + 1);
     }
-    await fixture.finish(error());
-    await vi.advanceTimersByTimeAsync(120000);
-    expect(fixture.sendMessage).toHaveBeenCalledTimes(delays.length);
+    if (captureAgent) {
+      fixture.sendMessage.mockImplementation(() => { fixture.agent.state.messages = [success]; });
+      await vi.advanceTimersByTimeAsync(60000);
+    } else {
+      await fixture.finish(success);
+    }
+    const attempts = fixture.sendMessage.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(180000);
+    expect(fixture.sendMessage).toHaveBeenCalledTimes(attempts);
+  });
+
+  it.each([false, true])("can cancel after more than eight retries (captured Agent: %s)", async captureAgent => {
+    const fixture = await setup(captureAgent);
+    const delays = [2000, 4000, 8000, 16000, 32000, ...Array(4).fill(60000)];
+    for (const [index, delay] of delays.entries()) {
+      if (!captureAgent || index === 0) await fixture.finish(error());
+      await vi.advanceTimersByTimeAsync(delay);
+    }
+    expect(fixture.sendMessage).toHaveBeenCalledTimes(9);
+    if (!captureAgent) await fixture.finish(error());
+    fixture.controller.abort();
+    await fixture.fire("turn_end", { message: { role: "assistant", stopReason: "aborted", content: [] } });
+    await vi.advanceTimersByTimeAsync(180000);
+    expect(fixture.sendMessage).toHaveBeenCalledTimes(9);
+  });
+
+  it("retains the ordinary error retry limit with a captured Agent", async () => {
+    const fixture = await setup(true);
+    fixture.sendMessage.mockImplementation(() => { fixture.agent.state.messages = [error("Connection error")]; });
+    await fixture.finish(error("Connection error"));
+    await vi.advanceTimersByTimeAsync(500000);
+    expect(fixture.sendMessage).toHaveBeenCalledTimes(8);
   });
 
   it("keeps permanent failures out of the fallback", async () => {

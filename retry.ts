@@ -35,7 +35,8 @@ const RETRY_CANCELLED_EVENT = "pi-retry:cancelled";
  *
  * Philosophy: any assistant message with stopReason === "error" is retried
  * with exponential backoff capped by settings, then stops after the configured
- * number of failures at the maximum delay, except a small blacklist of known
+ * number of failures at the maximum delay (server overload keeps retrying),
+ * except a small blacklist of known
  * permanent failures and hard-stop conditions (invalid API key, model not
  * found, quota/session-limit/budget exhaustion, suspended accounts, etc.).
  *
@@ -191,7 +192,6 @@ function lastMessageIsRetryableError(): boolean {
 
 export default function (pi: ExtensionAPI) {
   let overloadRetryAttempts = 0;
-  let overloadRetriesAtMaxDelay = 0;
 
   let _notifyFn: ((message: string, level: "info" | "warning" | "error") => void) | null = null;
 
@@ -201,7 +201,6 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("input", () => {
     overloadRetryAttempts = 0;
-    overloadRetriesAtMaxDelay = 0;
     _inputGeneration++;
     // The generation change cancels any older loop; the new user request gets
     // its own retry eligibility even if the previous request was aborted.
@@ -237,7 +236,6 @@ export default function (pi: ExtensionAPI) {
         stateConnection.succeed();
         stateOther.succeed();
         overloadRetryAttempts = 0;
-        overloadRetriesAtMaxDelay = 0;
         stateContinuation.complete();
         stateEmptyStop.complete();
         // Clear abort flag — this is a fresh successful turn, so any
@@ -537,7 +535,6 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("Manually retrying server overloaded error...", "info");
         stateOther.reset();
         overloadRetryAttempts = 0;
-        overloadRetriesAtMaxDelay = 0;
         if (!_agent) {
           void retryOverloadWithoutAgent();
         } else {
@@ -581,7 +578,6 @@ export default function (pi: ExtensionAPI) {
     // backoff sleep, or immediately after a hidden retry turn settles).
     _sessionGeneration++;
     overloadRetryAttempts = 0;
-    overloadRetriesAtMaxDelay = 0;
 
     state400.reset();
     stateCredit.reset();
@@ -623,12 +619,9 @@ export default function (pi: ExtensionAPI) {
   // class). Overload errors must still retry through the public session API.
   // Each completed turn emits agent_end, which schedules the next attempt if
   // it also failed with overload; successful turn_end resets the backoff.
+  // Overload retries have a delay cap but no attempt limit.
   async function retryOverloadWithoutAgent(signal?: AbortSignal): Promise<void> {
     if (_continueInProgress || _userAborted || signal?.aborted) return;
-    if (overloadRetriesAtMaxDelay >= retryConfig.maxRetriesAtMaxDelay) {
-      notifySafely("Server overload retries exhausted at the maximum backoff.", "warning");
-      return;
-    }
     const generation = _sessionGeneration;
     const inputGeneration = _inputGeneration;
     _continueInProgress = true;
@@ -640,7 +633,6 @@ export default function (pi: ExtensionAPI) {
       const interrupted = await interruptibleSleep(delay, generation, inputGeneration);
       if (interrupted || _userAborted || signal?.aborted ||
           generation !== _sessionGeneration || inputGeneration !== _inputGeneration) return;
-      if (delay >= retryConfig.maxDelayMs) overloadRetriesAtMaxDelay++;
       pi.sendMessage(
         {
           customType: RETRY_TRIGGER_CUSTOM_TYPE,
@@ -823,6 +815,12 @@ export default function (pi: ExtensionAPI) {
         // Stop ordinary retries after the configured number of failures at
         // the cap. The failed capped turns have already been delivered; this
         // check prevents scheduling one more capped request.
+        const lastResult = myAgent.state.messages[myAgent.state.messages.length - 1];
+        if (lastResult && hasOverloadedError(lastResult)) {
+          // Server overload is transient: keep retrying at the capped delay.
+          // These failures must not consume another error's retry allowance.
+          maxDelayRetries = 0;
+        }
         if (
           hiddenTurnKind === "retry" &&
           maxDelayRetries >= retryConfig.maxRetriesAtMaxDelay

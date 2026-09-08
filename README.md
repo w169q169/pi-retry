@@ -43,7 +43,7 @@ By default, pi has built-in retry for some errors (rate limits, 5xx, overloaded)
 
 ## The Solution
 
-This extension provides automatic retry for all errors with configurable exponential backoff and a maximum-delay failure limit (2s → 4s → 8s → ... → 60s by default).
+This extension provides automatic retry for all errors with configurable exponential backoff and a maximum-delay failure limit (2s → 4s → 8s → ... → 60s by default). Server overload errors, including `server_is_overloaded`, are exempt from the failure-count limit: they keep retrying at the capped delay until success or cancellation.
 
 **Philosophy: retry EVERYTHING by default.** The only things we skip are a tiny blacklist of known permanent failures (invalid API key, model not found, unsupported model, etc.).
 
