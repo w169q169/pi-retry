@@ -190,6 +190,9 @@ function lastMessageIsRetryableError(): boolean {
 }
 
 export default function (pi: ExtensionAPI) {
+  let overloadRetryAttempts = 0;
+  let overloadRetriesAtMaxDelay = 0;
+
   let _notifyFn: ((message: string, level: "info" | "warning" | "error") => void) | null = null;
 
   // Mark native retry as owned by this extension before the first agent turn.
@@ -197,6 +200,8 @@ export default function (pi: ExtensionAPI) {
   const retryConfig = loadPiRetryConfig();
 
   pi.on("input", () => {
+    overloadRetryAttempts = 0;
+    overloadRetriesAtMaxDelay = 0;
     _inputGeneration++;
     // The generation change cancels any older loop; the new user request gets
     // its own retry eligibility even if the previous request was aborted.
@@ -231,6 +236,8 @@ export default function (pi: ExtensionAPI) {
         stateCredit.succeed();
         stateConnection.succeed();
         stateOther.succeed();
+        overloadRetryAttempts = 0;
+        overloadRetriesAtMaxDelay = 0;
         stateContinuation.complete();
         stateEmptyStop.complete();
         // Clear abort flag — this is a fresh successful turn, so any
@@ -329,23 +336,14 @@ export default function (pi: ExtensionAPI) {
 
       // Pick the right state tracker for diagnostics
       let state: RetryState;
-      let label: string;
       if (category === "400-413") {
         state = state400;
-        label = "400/413";
       } else if (category === "credit") {
         state = stateCredit;
-        label = "Credit";
       } else if (category === "connection") {
         state = stateConnection;
-        label = "Connection";
       } else {
         state = stateOther;
-        label = hasOverloadedError(lastAssistant)
-          ? "Server Overloaded"
-          : category === "builtin"
-            ? "Server"
-            : "Other";
       }
 
       if (state.getIsRetrying()) return;
@@ -355,7 +353,11 @@ export default function (pi: ExtensionAPI) {
       state.startRetry(errorMsg);
       state.endRetry();
 
-      void triggerInvisibleContinue("retry");
+      if (!_agent && hasOverloadedError(lastAssistant)) {
+        void retryOverloadWithoutAgent(ctx.signal);
+      } else {
+        void triggerInvisibleContinue("retry");
+      }
       return;
     }
 
@@ -534,7 +536,13 @@ export default function (pi: ExtensionAPI) {
       if (hasOverloadedError(lastAssistant)) {
         ctx.ui.notify("Manually retrying server overloaded error...", "info");
         stateOther.reset();
-        void triggerInvisibleContinue("retry");
+        overloadRetryAttempts = 0;
+        overloadRetriesAtMaxDelay = 0;
+        if (!_agent) {
+          void retryOverloadWithoutAgent();
+        } else {
+          void triggerInvisibleContinue("retry");
+        }
         return;
       }
 
@@ -572,6 +580,8 @@ export default function (pi: ExtensionAPI) {
     // previous session exits on its next checkpoint (within 100ms during
     // backoff sleep, or immediately after a hidden retry turn settles).
     _sessionGeneration++;
+    overloadRetryAttempts = 0;
+    overloadRetriesAtMaxDelay = 0;
 
     state400.reset();
     stateCredit.reset();
@@ -608,6 +618,50 @@ export default function (pi: ExtensionAPI) {
       });
     }
   });
+
+  // Agent capture can be unavailable (for example, a separately loaded Agent
+  // class). Overload errors must still retry through the public session API.
+  // Each completed turn emits agent_end, which schedules the next attempt if
+  // it also failed with overload; successful turn_end resets the backoff.
+  async function retryOverloadWithoutAgent(signal?: AbortSignal): Promise<void> {
+    if (_continueInProgress || _userAborted || signal?.aborted) return;
+    if (overloadRetriesAtMaxDelay >= retryConfig.maxRetriesAtMaxDelay) {
+      notifySafely("Server overload retries exhausted at the maximum backoff.", "warning");
+      return;
+    }
+    const generation = _sessionGeneration;
+    const inputGeneration = _inputGeneration;
+    _continueInProgress = true;
+    _continueGeneration = generation;
+    _continueInputGeneration = inputGeneration;
+    const delay = calculateDelay(++overloadRetryAttempts, retryConfig);
+    try {
+      _notifyRetryAttempt(overloadRetryAttempts, delay);
+      const interrupted = await interruptibleSleep(delay, generation, inputGeneration);
+      if (interrupted || _userAborted || signal?.aborted ||
+          generation !== _sessionGeneration || inputGeneration !== _inputGeneration) return;
+      if (delay >= retryConfig.maxDelayMs) overloadRetriesAtMaxDelay++;
+      pi.sendMessage(
+        {
+          customType: RETRY_TRIGGER_CUSTOM_TYPE,
+          content: "Retry the previous request.",
+          display: false,
+          details: undefined,
+        },
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
+    } catch (error) {
+      if (!isStaleContextError(error)) {
+        notifySafely(`Could not retry server overload: ${String(error)}`, "error");
+      }
+    } finally {
+      if (_continueGeneration === generation && _continueInputGeneration === inputGeneration) {
+        _continueInProgress = false;
+        _continueGeneration = null;
+        _continueInputGeneration = null;
+      }
+    }
+  }
 
   // Retry loop driver — the core of pi-retry.
   //

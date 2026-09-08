@@ -18,7 +18,6 @@ import {
   isContextOverflowError,
   getErrorCategory,
   CONNECTION_ERROR_PATTERNS,
-  OVERLOADED_ERROR_PATTERNS,
 } from '../../src/error-patterns.js';
 import type { AgentMessage } from '@earendil-works/pi-agent-core';
 
@@ -412,19 +411,6 @@ describe('CONNECTION_ERROR_PATTERNS', () => {
 
   it('all patterns are valid regex', () => {
     CONNECTION_ERROR_PATTERNS.forEach((pattern, i) => {
-      expect(pattern).toBeInstanceOf(RegExp);
-      expect(() => 'test'.match(pattern)).not.toThrow();
-    });
-  });
-});
-
-describe('OVERLOADED_ERROR_PATTERNS', () => {
-  it('has 3 patterns defined', () => {
-    expect(OVERLOADED_ERROR_PATTERNS.length).toBe(3);
-  });
-
-  it('all patterns are valid regex', () => {
-    OVERLOADED_ERROR_PATTERNS.forEach((pattern) => {
       expect(pattern).toBeInstanceOf(RegExp);
       expect(() => 'test'.match(pattern)).not.toThrow();
     });

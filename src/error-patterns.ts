@@ -15,8 +15,6 @@ export const CONTINUATION_CUSTOM_TYPE = "pi-retry:continue";
 // ── Specific pattern groups (used for categorisation / messaging) ──
 
 export const OVERLOADED_ERROR_PATTERNS = [
-  /server_is_overloaded/i,
-  /servers?\s*(?:are|is)?\s*(?:currently\s*)?overloaded/i,
   /overloaded/i,
 ];
 
@@ -116,8 +114,6 @@ const NON_OVERFLOW_PATTERNS = [
   /^(Throttling error|Service unavailable):/i,
   /rate limit/i,
   /too many requests/i,
-  /server_is_overloaded/i,
-  /overloaded/i,
 ];
 
 // ── Blacklist: errors that are truly permanent and should NOT be retried ──
@@ -336,7 +332,6 @@ export function getErrorCategory(errorMessage: string): '400-413' | 'credit' | '
   if (ERROR_400_413_PATTERNS.some(p => p.test(errorMessage))) return '400-413';
   if (CREDIT_ERROR_PATTERNS.some(p => p.test(errorMessage))) return 'credit';
   if (CONNECTION_ERROR_PATTERNS.some(p => p.test(errorMessage))) return 'connection';
-  if (OVERLOADED_ERROR_PATTERNS.some(p => p.test(errorMessage))) return 'builtin';
   if (BUILTIN_HANDLED_PATTERNS.some(p => p.test(errorMessage))) return 'builtin';
   return 'other';
 }
