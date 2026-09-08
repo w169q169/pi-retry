@@ -14,6 +14,12 @@ export const CONTINUATION_CUSTOM_TYPE = "pi-retry:continue";
 
 // ── Specific pattern groups (used for categorisation / messaging) ──
 
+export const OVERLOADED_ERROR_PATTERNS = [
+  /server_is_overloaded/i,
+  /servers?\s*(?:are|is)?\s*(?:currently\s*)?overloaded/i,
+  /overloaded/i,
+];
+
 const ERROR_400_413_PATTERNS = [
   /\b4(00|13)\b.*status code/i,
   /bad request/i,
@@ -56,7 +62,7 @@ export const CONNECTION_ERROR_PATTERNS = [
 
 // Patterns handled by pi's built-in retry — used for categorisation only
 const BUILTIN_HANDLED_PATTERNS = [
-  /overloaded/i,
+  ...OVERLOADED_ERROR_PATTERNS,
   /rate\s*limit/i,
   /too\s*many\s*requests/i,
   /429/i,
@@ -110,6 +116,8 @@ const NON_OVERFLOW_PATTERNS = [
   /^(Throttling error|Service unavailable):/i,
   /rate limit/i,
   /too many requests/i,
+  /server_is_overloaded/i,
+  /overloaded/i,
 ];
 
 // ── Blacklist: errors that are truly permanent and should NOT be retried ──
@@ -246,6 +254,12 @@ export function hasConnectionError(message: AgentMessage): boolean {
   return CONNECTION_ERROR_PATTERNS.some(p => p.test(message.errorMessage!));
 }
 
+export function hasOverloadedError(message: AgentMessage): boolean {
+  if (!isAssistantMessage(message)) return false;
+  if (message.stopReason !== "error" || !message.errorMessage) return false;
+  return OVERLOADED_ERROR_PATTERNS.some(p => p.test(message.errorMessage!));
+}
+
 /**
  * Returns true for an error assistant message whose errorMessage indicates a
  * context-overflow (input exceeded the model's context window).
@@ -322,6 +336,7 @@ export function getErrorCategory(errorMessage: string): '400-413' | 'credit' | '
   if (ERROR_400_413_PATTERNS.some(p => p.test(errorMessage))) return '400-413';
   if (CREDIT_ERROR_PATTERNS.some(p => p.test(errorMessage))) return 'credit';
   if (CONNECTION_ERROR_PATTERNS.some(p => p.test(errorMessage))) return 'connection';
+  if (OVERLOADED_ERROR_PATTERNS.some(p => p.test(errorMessage))) return 'builtin';
   if (BUILTIN_HANDLED_PATTERNS.some(p => p.test(errorMessage))) return 'builtin';
   return 'other';
 }

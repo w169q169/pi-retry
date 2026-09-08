@@ -6,6 +6,7 @@ import {
   has400or413Error,
   hasCreditError,
   hasConnectionError,
+  hasOverloadedError,
   hasRetryableError,
   isNonRetryableError,
   isSilencedError,
@@ -340,7 +341,11 @@ export default function (pi: ExtensionAPI) {
         label = "Connection";
       } else {
         state = stateOther;
-        label = category === "builtin" ? "Server" : "Other";
+        label = hasOverloadedError(lastAssistant)
+          ? "Server Overloaded"
+          : category === "builtin"
+            ? "Server"
+            : "Other";
       }
 
       if (state.getIsRetrying()) return;
@@ -522,6 +527,13 @@ export default function (pi: ExtensionAPI) {
       if (hasConnectionError(lastAssistant)) {
         ctx.ui.notify("Manually retrying connection error...", "info");
         stateConnection.reset();
+        void triggerInvisibleContinue("retry");
+        return;
+      }
+
+      if (hasOverloadedError(lastAssistant)) {
+        ctx.ui.notify("Manually retrying server overloaded error...", "info");
+        stateOther.reset();
         void triggerInvisibleContinue("retry");
         return;
       }
