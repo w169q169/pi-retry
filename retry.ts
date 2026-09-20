@@ -1,10 +1,12 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
-import type { Agent } from "@earendil-works/pi-agent-core";
+import { Agent } from "@earendil-works/pi-agent-core";
+import { AgentSession } from "@earendil-works/pi-coding-agent";
 import {
   has400or413Error,
   hasCreditError,
   hasConnectionError,
+  hasOverloadedError,
   hasRetryableError,
   isNonRetryableError,
   isSilencedError,
@@ -16,6 +18,7 @@ import {
   getLastAssistantMessage,
   calculateDelay,
   DEFAULT_RETRY_CONFIG,
+  loadPiRetryConfig,
   loadPiRetrySettings,
   formatDuration,
   formatRetryCountdown,
@@ -41,17 +44,43 @@ const RETRY_STARTED_EVENT = "pi-retry:started";
 const RETRY_COMPLETED_EVENT = "pi-retry:completed";
 const RETRY_CANCELLED_EVENT = "pi-retry:cancelled";
 
-// The registry only patches the supported SDK seam. Unsupported shapes leave
-// native retry untouched and disable extension takeover rather than stranding a
-// child prompt in an out-of-band loop.
+// The registry only patches the supported SDK seam (bindExtensions +
+// _prepareRetry on AgentSession.prototype). Older pi builds without that
+// seam fall back to the pre-0.10.0 capture: the Agent is grabbed through the
+// subscribe hook and native retry is suppressed via a direct _prepareRetry
+// patch, so ordinary sessions keep retrying instead of the extension going
+// totally inert.
 const sdkHooksSupported = installRetrySdkHooks();
+
+// Fallback Agent captured via Agent.prototype.subscribe when the registry
+// seam is unavailable. Last writer wins, mirroring the pre-0.10.0 design.
+let _fallbackAgent: Agent | null = null;
+if (!sdkHooksSupported) {
+  const agentProto = Agent.prototype as unknown as Record<PropertyKey, unknown>;
+  if (typeof agentProto.subscribe === "function") {
+    const origSubscribe = agentProto.subscribe as (this: Agent, ...args: unknown[]) => unknown;
+    agentProto.subscribe = function (this: Agent, ...args: unknown[]) {
+      _fallbackAgent = this;
+      return origSubscribe.apply(this, args);
+    };
+    const sessionProto = AgentSession.prototype as unknown as Record<PropertyKey, unknown>;
+    if (typeof sessionProto._prepareRetry === "function") {
+      // Suppress native retry so the two schedulers cannot interleave; the
+      // fallback loop owns the backoff, exactly like the pre-0.10.0 patch.
+      sessionProto._prepareRetry = function (this: unknown, _message: unknown) {
+        return Promise.resolve(false);
+      };
+    }
+  }
+}
 
 /**
  * Unified retry extension — retries EVERY error by default.
  *
  * Philosophy: any assistant message with stopReason === "error" is retried
  * with exponential backoff capped by settings, then stops after the configured
- * number of failures at the maximum delay, except a small blacklist of known
+ * number of failures at the maximum delay (server overload keeps retrying),
+ * except a small blacklist of known
  * permanent failures and hard-stop conditions (invalid API key, model not
  * found, quota/session-limit/budget exhaustion, suspended accounts, etc.).
  *
@@ -152,6 +181,37 @@ function skipLiveBackoff(): "none" | "skipped" | "running" {
   if (!_wakeBackoffSleep) return "running";
   _wakeBackoffSleep();
   return "skipped";
+}
+
+// Upper bound for one waitForIdle wait inside the retry loop. Any legitimate
+// turn settles well below this (the default HTTP idle timeout is 5 minutes
+// plus tool execution); only a wedged run — a hung stream whose abort never
+// fires, or an agent_end listener that never settles — exceeds it. Without
+// this bound, one wedged run would hold the retry mutex forever and silently
+// disable retries for the rest of the process.
+const WAIT_FOR_IDLE_LIMIT_MS = 15 * 60_000;
+
+/**
+ * Wait for the agent to settle, giving up after WAIT_FOR_IDLE_LIMIT_MS.
+ *
+ * @param agent Agent whose active run (if any) the loop is waiting on.
+ * @returns true when the agent settled normally; false when the bound elapsed.
+ */
+function waitForIdleBounded(agent: Agent): Promise<boolean> {
+  return new Promise<boolean>(resolve => {
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), WAIT_FOR_IDLE_LIMIT_MS);
+    agent.waitForIdle().then(
+      () => finish(true),
+      () => finish(true), // A rejected run promise still means "settled".
+    );
+  });
 }
 
 // Interruptible sleep: polls _userAborted and _sessionGeneration every
@@ -283,12 +343,19 @@ function readEffectiveSystemPrompt(ctx: { getSystemPrompt?: () => string }): str
 }
 
 export default function (pi: ExtensionAPI) {
+  let overloadRetryAttempts = 0;
+
   let _notifyFn: ((message: string, level: "info" | "warning" | "error") => void) | null = null;
   let _setStatusFn: ((text: string | undefined) => void) | null = null;
   // Successful turns can occur inside a run before waitForIdle observes its final error.
   // TEST:__tests__/unit/user-retry-regression.test.ts[restarts ordinary backoff after tool success inside the same run]
   let successGeneration = 0;
   let retryConfig = { ...DEFAULT_RETRY_CONFIG };
+  // Fallback builds never run configureSession's registry assignment; read
+  // the ordinary policy once so settings.json still shapes the backoff.
+  if (!sdkHooksSupported) {
+    retryConfig = loadPiRetryConfig();
+  }
   const owner = pi as unknown as object;
   // Policy source of each inline controller, so a session reclassified between
   // session_start and before_agent_start never keeps the other policy.
@@ -394,9 +461,10 @@ export default function (pi: ExtensionAPI) {
     return binding;
   }
 
-  // Unsupported SDK versions retain native retry and do not enter the
-  // extension's detached/inline scheduling paths.
-  if (!sdkHooksSupported) return;
+  // Unsupported SDK versions keep the ordinary handlers registered (the
+  // fallback subscribe-capture drives retries); only the registry-dependent
+  // child-session features are unreachable, and getRetrySession returning
+  // undefined makes every child branch skip naturally.
 
 
   /**
@@ -410,7 +478,7 @@ export default function (pi: ExtensionAPI) {
     ctx: { sessionManager?: unknown },
   ): void {
     const sessionManager = ctx.sessionManager;
-    const agent = getSessionAgent(sessionManager);
+    const agent = getSessionAgent(sessionManager) ?? _fallbackAgent;
     if (!agent) return;
     void triggerInvisibleContinue(kind, agent, sessionManager);
   }
@@ -427,6 +495,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("input", (_event, ctx) => {
+    overloadRetryAttempts = 0;
     const binding = getRetrySession(ctx.sessionManager);
     if (binding && binding.owner !== owner) return;
     if (binding?.isChild) {
@@ -478,6 +547,7 @@ export default function (pi: ExtensionAPI) {
         stateCredit.succeed();
         stateConnection.succeed();
         stateOther.succeed();
+        overloadRetryAttempts = 0;
         stateContinuation.complete();
         stateEmptyStop.complete();
         // Clear abort flag — this is a fresh successful turn, so any
@@ -498,6 +568,7 @@ export default function (pi: ExtensionAPI) {
   // triggerInvisibleContinue(), which owns the retry loop with backoff
   // sleeps that happen AFTER processEvents returns (outside the agent run).
   pi.on("agent_end", async (event, ctx) => {
+    sendLoadedMarker();
     const binding = getRetrySession(ctx.sessionManager);
     if (binding && binding.owner !== owner) return;
     if (binding?.isChild) {
@@ -583,19 +654,14 @@ export default function (pi: ExtensionAPI) {
 
       // Pick the right state tracker for diagnostics
       let state: RetryState;
-      let label: string;
       if (category === "400-413") {
         state = state400;
-        label = "400/413";
       } else if (category === "credit") {
         state = stateCredit;
-        label = "Credit";
       } else if (category === "connection") {
         state = stateConnection;
-        label = "Connection";
       } else {
         state = stateOther;
-        label = category === "builtin" ? "Server" : "Other";
       }
 
       if (state.getIsRetrying()) return;
@@ -605,7 +671,11 @@ export default function (pi: ExtensionAPI) {
       state.startRetry(errorMsg);
       state.endRetry();
 
-      triggerForContext("retry", ctx);
+      if (!getSessionAgent(ctx.sessionManager) && hasOverloadedError(lastAssistant)) {
+        void retryOverloadWithoutAgent(ctx.signal);
+      } else {
+        triggerForContext("retry", ctx);
+      }
       return;
     }
 
@@ -703,8 +773,12 @@ export default function (pi: ExtensionAPI) {
         status += `  Base delay: ${retryConfig.baseDelayMs}ms\n`;
         status += `  Max delay: ${retryConfig.maxDelayMs}ms\n`;
         status += `  Backoff multiplier: ${retryConfig.multiplier}\n`;
-        status += `  Max-delay failures: ${retryConfig.maxRetriesAtMaxDelay}\n`;
-        status += "  Retry loop: until success, abort, or the max-delay failure limit\n\n";
+        status += `  Max-delay failures: ${
+          retryConfig.maxRetriesAtMaxDelay > 0 ? retryConfig.maxRetriesAtMaxDelay : "unlimited"
+        }\n`;
+        status += retryConfig.maxRetriesAtMaxDelay > 0
+          ? "  Retry loop: until success, abort, or the max-delay failure limit\n\n"
+          : "  Retry loop: until success or abort\n\n";
 
         // Last assistant info
         if (lastAssistant && isAssistantMessage(lastAssistant)) {
@@ -821,6 +895,18 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      if (hasOverloadedError(lastAssistant)) {
+        ctx.ui.notify("Manually retrying server overloaded error...", "info");
+        stateOther.reset();
+        overloadRetryAttempts = 0;
+        if (!getSessionAgent(ctx.sessionManager)) {
+          void retryOverloadWithoutAgent();
+        } else {
+          triggerForContext("retry", ctx);
+        }
+        return;
+      }
+
       // Catch-all: any other retryable error
       if (hasRetryableError(lastAssistant)) {
         ctx.ui.notify("Manually retrying error...", "info");
@@ -860,8 +946,35 @@ export default function (pi: ExtensionAPI) {
     _terminalInputUnsubscribe = null;
   });
 
+  // One-time per-process load marker for FALLBACK builds only. Registry
+  // builds self-evidence through pi-retry:retry journal entries; the silent
+  // failure mode is exactly the fallback path (older SDK without the
+  // bindExtensions seam), so only there is a marker needed. Lands in the
+  // journal as a hidden custom message — `pi-retry-log` or a plain grep then
+  // proves which build is actually running in any process.
+  let _loadedMarkerSent = false;
+  function sendLoadedMarker(): void {
+    if (sdkHooksSupported || _loadedMarkerSent) return;
+    _loadedMarkerSent = true;
+    try {
+      pi.sendMessage(
+        {
+          customType: "pi-retry:loaded",
+          content: "pi-retry active (fallback mode: session-registry seam unavailable)",
+          display: false,
+          details: { mode: "fallback", sdkHooksSupported: false },
+        },
+        { triggerTurn: false },
+      );
+    } catch {
+      // Session not ready yet — retry on the next event.
+      _loadedMarkerSent = false;
+    }
+  }
+
   // Initialize
   pi.on("session_start", async (_event, ctx) => {
+    sendLoadedMarker();
     const binding = configureSession(ctx);
     if (binding && binding.owner !== owner) return;
     if (binding?.isChild) return;
@@ -870,6 +983,7 @@ export default function (pi: ExtensionAPI) {
     // previous session exits on its next checkpoint (within 100ms during
     // backoff sleep, or immediately after a hidden retry turn settles).
     _sessionGeneration++;
+    overloadRetryAttempts = 0;
 
     state400.reset();
     stateCredit.reset();
@@ -888,7 +1002,9 @@ export default function (pi: ExtensionAPI) {
     _terminalInputUnsubscribe?.();
     _terminalInputUnsubscribe = null;
 
-    if (ctx.mode === "tui") {
+    // Older SDK builds may not expose terminal-input subscriptions; guard
+    // so a missing hook cannot break session startup.
+    if (ctx.mode === "tui" && typeof ctx.ui.onTerminalInput === "function") {
       _terminalInputUnsubscribe = ctx.ui.onTerminalInput(data => {
         if (
           !matchesKey(data, "escape") ||
@@ -908,6 +1024,51 @@ export default function (pi: ExtensionAPI) {
       });
     }
   });
+
+  // Agent capture can be unavailable (for example, a separately loaded Agent
+  // class). Overload errors must still retry through the public session API.
+  // Each completed turn emits agent_end, which schedules the next attempt if
+  // it also failed with overload; successful turn_end resets the backoff.
+  // Overload retries have a delay cap but no attempt limit.
+  async function retryOverloadWithoutAgent(signal?: AbortSignal): Promise<void> {
+    if (_continueInProgress || _userAborted || signal?.aborted) return;
+    const generation = _sessionGeneration;
+    const inputGeneration = _inputGeneration;
+    _continueInProgress = true;
+    _continueGeneration = generation;
+    _continueInputGeneration = inputGeneration;
+    const delay = calculateDelay(++overloadRetryAttempts, retryConfig);
+    try {
+      const interrupted = await interruptibleSleep(
+        delay,
+        generation,
+        inputGeneration,
+        remainingMs => updateRetryCountdown(overloadRetryAttempts, remainingMs),
+      );
+      setRetryStatus(undefined);
+      if (interrupted || _userAborted || signal?.aborted ||
+          generation !== _sessionGeneration || inputGeneration !== _inputGeneration) return;
+      pi.sendMessage(
+        {
+          customType: RETRY_TRIGGER_CUSTOM_TYPE,
+          content: "Retry the previous request.",
+          display: false,
+          details: undefined,
+        },
+        { triggerTurn: true, deliverAs: "followUp" },
+      );
+    } catch (error) {
+      if (!isStaleContextError(error)) {
+        notifySafely(`Could not retry server overload: ${String(error)}`, "error");
+      }
+    } finally {
+      if (_continueGeneration === generation && _continueInputGeneration === inputGeneration) {
+        _continueInProgress = false;
+        _continueGeneration = null;
+        _continueInputGeneration = null;
+      }
+    }
+  }
 
   // Retry loop driver — the core of pi-retry.
   //
@@ -961,8 +1122,17 @@ export default function (pi: ExtensionAPI) {
       emitRetryLifecycleEvent(RETRY_STARTED_EVENT, retryLifecycleId);
 
       // Wait for the current run to finish (activeRun resolves in
-      // finishRun() after agent_end listeners return).
-      await myAgent.waitForIdle();
+      // finishRun() after agent_end listeners return). Bounded: a wedged run
+      // (hung provider stream whose abort never fires, or an agent_end
+      // listener that never settles) would otherwise hold the retry mutex
+      // forever, silently disabling retries for the rest of the process.
+      if (!(await waitForIdleBounded(myAgent))) {
+        notifySafely(
+          "Retry loop stalled waiting for the agent to settle; releasing retry control.",
+          "warning",
+        );
+        return;
+      }
 
       // AgentSession clears its outer lifecycle immediately after Agent's
       // active run resolves. Yield to the next macrotask so the detached path
@@ -989,7 +1159,8 @@ export default function (pi: ExtensionAPI) {
       // Stop after MAX_EMPTY_CONTINUATIONS rather than looping forever.
       let emptyNudges = 0;
       // Only ordinary retries count toward the maximum-delay cutoff; token
-      // continuations intentionally remain uncapped.
+      // continuations intentionally remain uncapped. The cutoff itself is
+      // opt-in: without a positive limit, retries continue indefinitely.
       let maxDelayRetries = 0;
 
       // Loop until success, abort, or session change.
@@ -1039,6 +1210,10 @@ export default function (pi: ExtensionAPI) {
         if (hiddenTurnKind === "retry" && isMaxDelay) {
           maxDelayRetries++;
         }
+        // Another driver (e.g. the goal extension's agent_settled continuation)
+        // may run a turn during the backoff. Remember the transcript length so
+        // the post-sleep check can detect that and drop a now-stale retry.
+        const messagesBeforeSleep = myAgent.state.messages.length;
 
         // Interruptible sleep with backoff BEFORE the retry attempt. The
         // helper emits the initial frame and replaces it every 100ms instead
@@ -1054,6 +1229,22 @@ export default function (pi: ExtensionAPI) {
         );
         setRetryStatus(undefined);
         if (interrupted || _inputGeneration !== myInputGeneration) return;
+
+        // The backoff elapsed, but another driver may have already run a turn
+        // (goal continuation, a queued follow-up). Sending "Retry the previous
+        // request" over a recovered transcript wastes a model turn and injects
+        // a stray instruction, so re-classify the tail first: keep retrying a
+        // NEW failure, stop when the turn already ended non-retryably.
+        if (myAgent.state.messages.length !== messagesBeforeSleep) {
+          hiddenTurnKind = getHiddenTurnKind(myAgent);
+          if (!hiddenTurnKind) {
+            didRetryComplete = true;
+            return;
+          }
+          // A new failure (or length-stop) needs its trailing error stripped
+          // and a fresh backoff slot; loop back through the normal path.
+          continue;
+        }
 
         try {
           pi.sendMessage(
@@ -1075,8 +1266,16 @@ export default function (pi: ExtensionAPI) {
           // sendMessage is fire-and-forget, but AgentSession publishes the
           // low-level run synchronously before returning. Waiting on Agent
           // keeps this retry loop intact without bypassing session state.
+          // Bounded for the same reason as the initial wait: a wedged retry
+          // turn must not hold the mutex forever.
           await Promise.resolve();
-          await myAgent.waitForIdle();
+          if (!(await waitForIdleBounded(myAgent))) {
+            notifySafely(
+              "Retry loop stalled waiting for the retry turn to settle; releasing retry control.",
+              "warning",
+            );
+            return;
+          }
         } catch {
           return;
         }
@@ -1097,12 +1296,19 @@ export default function (pi: ExtensionAPI) {
           return;
         }
 
-        // Stop ordinary retries after the configured number of failures at
-        // the cap. The failed capped turns have already been delivered; this
-        // check prevents scheduling one more capped request.
+        // Stop ordinary retries once the configured number of failures at the
+        // cap is reached. The default configuration is unlimited, so this only
+        // applies when settings.json opts into a cutoff.
+        const lastResult = myAgent.state.messages[myAgent.state.messages.length - 1];
+        if (lastResult && hasOverloadedError(lastResult)) {
+          // Server overload is transient: keep retrying at the capped delay.
+          // These failures must not consume another error's retry allowance.
+          maxDelayRetries = 0;
+        }
         if (
           hiddenTurnKind === "retry" &&
           observedSuccessGeneration === successGeneration &&
+          retryConfig.maxRetriesAtMaxDelay > 0 &&
           maxDelayRetries >= retryConfig.maxRetriesAtMaxDelay
         ) {
           notifySafely(

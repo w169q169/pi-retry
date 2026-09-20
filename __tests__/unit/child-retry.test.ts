@@ -149,6 +149,43 @@ describe("ChildRetryController retry lifecycle", () => {
     expect(fixture.delays).toEqual([10, 20, 10]);
   });
 
+  it.each([false, true])("retries beyond the cap when unlimited (messageFreeRetries=%s)", async messageFreeRetries => {
+    const fixture = createFixture({
+      baseDelayMs: 10,
+      maxDelayMs: 10,
+      multiplier: 2,
+      maxRetriesAtMaxDelay: 0,
+      messageFreeRetries,
+    });
+
+    for (let index = 0; index < 5; index++) {
+      await fixture.controller.handleAgentEnd(fixture.ctx);
+    }
+
+    expect(fixture.delays).toEqual([10, 10, 10, 10, 10]);
+    expect(fixture.sends).toHaveLength(messageFreeRetries ? 0 : 5);
+    expect(fixture.notifications).toEqual([]);
+  });
+
+  it("stops automatic retries at a positive cap", async () => {
+    const fixture = createFixture({
+      baseDelayMs: 10,
+      maxDelayMs: 10,
+      multiplier: 2,
+      maxRetriesAtMaxDelay: 2,
+    });
+
+    for (let index = 0; index < 3; index++) {
+      await fixture.controller.handleAgentEnd(fixture.ctx);
+    }
+
+    expect(fixture.sends).toHaveLength(2);
+    expect(fixture.notifications).toEqual([{
+      message: "Retry failed 2 times at the maximum backoff; giving up.",
+      level: "warning",
+    }]);
+  });
+
   // TEST:__tests__/unit/child-retry.test.ts[manual retry after cap]
   it("allows a manual retry to start a fresh lifecycle after the cap", async () => {
     const fixture = createFixture({

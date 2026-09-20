@@ -14,6 +14,10 @@ export const CONTINUATION_CUSTOM_TYPE = "pi-retry:continue";
 
 // ── Specific pattern groups (used for categorisation / messaging) ──
 
+export const OVERLOADED_ERROR_PATTERNS = [
+  /overloaded/i,
+];
+
 const ERROR_400_413_PATTERNS = [
   /\b4(00|13)\b.*status code/i,
   /bad request/i,
@@ -56,7 +60,7 @@ export const CONNECTION_ERROR_PATTERNS = [
 
 // Patterns handled by pi's built-in retry — used for categorisation only
 const BUILTIN_HANDLED_PATTERNS = [
-  /overloaded/i,
+  ...OVERLOADED_ERROR_PATTERNS,
   /rate\s*limit/i,
   /too\s*many\s*requests/i,
   /429/i,
@@ -244,6 +248,12 @@ export function hasConnectionError(message: AgentMessage): boolean {
   if (!isAssistantMessage(message)) return false;
   if (message.stopReason !== "error" || !message.errorMessage) return false;
   return CONNECTION_ERROR_PATTERNS.some(p => p.test(message.errorMessage!));
+}
+
+export function hasOverloadedError(message: AgentMessage): boolean {
+  if (!isAssistantMessage(message)) return false;
+  if (message.stopReason !== "error" || !message.errorMessage) return false;
+  return OVERLOADED_ERROR_PATTERNS.some(p => p.test(message.errorMessage!));
 }
 
 /**

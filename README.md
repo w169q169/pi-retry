@@ -29,11 +29,11 @@ This extension automatically detects and retries **all** errors by default, with
 
 | Error Type | Retry Behavior | Use Case |
 |------------|----------------|----------|
-| **Any retryable error** (catch-all) | **Capped exponential retry** | Everything else — provider hiccups, stream exhaustion, credit issues, unknown errors |
-| HTTP 400/413 | **Capped** with exponential backoff, NO compaction | Transient context overflow that might resolve |
-| Credit / payment errors | **Capped** with exponential backoff | "Not Enough Credits", insufficient balance, 402 — top up and the retry loop auto-resumes |
+| **Any retryable error** (catch-all) | **Infinite retry**, capped exponential backoff | Everything else — provider hiccups, stream exhaustion, credit issues, unknown errors |
+| HTTP 400/413 | **Infinite retry**, capped exponential backoff, NO compaction | Transient context overflow that might resolve |
+| Credit / payment errors | **Infinite retry**, capped exponential backoff | "Not Enough Credits", insufficient balance, 402 — top up and the retry loop auto-resumes |
 | **Quota / session-limit / budget exhaustion** | **Not retried** — notify + stop | "You've hit your limit", `insufficient_quota`, "out of budget", suspended accounts |
-| Connection errors | **Capped** with exponential backoff | Network hiccups, connection drops, socket errors, stream exhaustion |
+| Connection errors | **Infinite retry**, capped exponential backoff | Network hiccups, connection drops, socket errors, stream exhaustion |
 | Max tokens (`stopReason: "length"`) | **Auto-continue** indefinitely with hidden continuation turns | Model hits output token limit mid-generation |
 | Empty / think-only stop (`stopReason: "stop"` with no text or tool calls) | **Nudge once** with a hidden continuation, then give up | Model ends its turn with no usable output (Anthropic empty responses with end_turn, thinking-only turns) |
 
@@ -51,7 +51,7 @@ By default, pi has built-in retry for some errors (rate limits, 5xx, overloaded)
 
 ## The Solution
 
-This extension provides automatic retry for all errors with configurable exponential backoff and a maximum-delay failure limit (2s → 4s → 8s → ... → 60s by default).
+This extension provides automatic retry for all errors with configurable exponential backoff (2s → 4s → 8s → ... → 60s by default). By default retries never stop: the loop keeps going at the capped delay until the turn succeeds or you abort. An optional maximum-delay failure limit is available for anyone who prefers a cutoff.
 
 **Philosophy: retry EVERYTHING by default.** The only things we skip are a tiny blacklist of known permanent failures (invalid API key, model not found, unsupported model, etc.).
 
@@ -59,9 +59,9 @@ This extension provides automatic retry for all errors with configurable exponen
 - **Catch-all retry** — Any `stopReason: "error"` is retried, regardless of error message
 - Automatic detection of 400/413, connection, credit, and stream exhaustion errors
 - **Auto-continuation** when the model hits its max output tokens (`stopReason: "length"`) — indefinite, no cap, hidden from the TUI
-- **Retry cutoff** — Keeps retrying until success, abort, or the configured number of failures at the maximum delay
+- **Infinite retry** — Keeps retrying until success or abort; a maximum-delay failure limit is opt-in via `maxRetriesAtMaxDelay`
 - **Auto-stop on quota/budget exhaustion** — Session limits, plan quotas, and budget caps ("You've hit your limit", "out of budget", `insufficient_quota`, suspended accounts) are detected and **not** retried, with a notification explaining why
-- Exponential backoff with configurable base delay, cap, multiplier, and maximum-delay failure count
+- Exponential backoff with configurable base delay, cap, multiplier, and optional maximum-delay failure count
 - **Hidden triggers** — provider-valid custom messages use `display: false`, so retries do not add TUI clutter
 - Manual controls via unified `/retry` command
 - Non-retryable errors are explicitly logged so you know why we didn't retry
@@ -140,19 +140,19 @@ The extension reads a `piRetry` object from Pi's settings files:
     "baseDelayMs": 10000,
     "maxDelayMs": 3600000,
     "multiplier": 2,
-    "maxRetriesAtMaxDelay": 3
+    "maxRetriesAtMaxDelay": 0
   }
 }
 ```
 
-The example above waits 10 seconds before the first retry, doubles each delay, caps the delay at one hour, and stops after three failed retries at that cap. Supported values are:
+The example above waits 10 seconds before the first retry, doubles each delay, caps the delay at one hour, and keeps retrying at that cap until the turn succeeds or you abort. Supported values are:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `baseDelayMs` | `2000` | Delay before the first retry, in milliseconds |
 | `maxDelayMs` | `60000` | Maximum delay between retries, in milliseconds |
 | `multiplier` | `2` | Exponential backoff multiplier; must be at least `1` |
-| `maxRetriesAtMaxDelay` | `3` | Failed ordinary retries allowed after the delay reaches `maxDelayMs` |
+| `maxRetriesAtMaxDelay` | `0` | Failed ordinary retries allowed after the delay reaches `maxDelayMs`; `0` retries forever |
 | `messageFreeRetries` | `false` | Retry errors without a hidden retry message (see below) |
 
 `piRetry` is separate from Pi's built-in `retry` object so the two retry policies do not share ambiguous settings. The extension disables Pi's native retry scheduler while it is loaded, while preserving Pi's compaction handling, so only one retry loop owns the backoff schedule.

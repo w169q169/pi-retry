@@ -331,6 +331,17 @@ describe("reported retry regressions", () => {
   // The ordinary driver already owns a completed loop before manual retry starts.
   // TEST:__tests__/unit/user-retry-regression.test.ts[manual retry after ordinary cap]
   it("allows manual retry after the ordinary retry cap", async () => {
+    const { DEFAULT_RETRY_CONFIG } = await import("../../src/config.ts");
+    vi.doMock("../../src/config.ts", async importOriginal => {
+      const actual = await importOriginal<typeof import("../../src/config.ts")>();
+      const pinned = { ...DEFAULT_RETRY_CONFIG, maxRetriesAtMaxDelay: 3 };
+      return {
+        ...actual,
+        // The default is unlimited; pin a cutoff so the cap can be reached.
+        DEFAULT_RETRY_CONFIG: pinned,
+        loadPiRetryConfig: () => pinned,
+      };
+    });
     const { commands, handlers, manager, ctx, restore } = await setup();
     try {
       const agent = attachAgent(manager, currentAgent => {
@@ -351,6 +362,7 @@ describe("reported retry regressions", () => {
       expect(agent.prompt.mock.calls.length).toBe(attemptsBeforeManual + 1);
     } finally {
       restore();
+      vi.doUnmock("../../src/config.ts");
     }
   });
 });

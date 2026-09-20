@@ -360,7 +360,11 @@ export class ChildRetryController {
       if (kind === "retry") {
         this.retryAttempt++;
       }
-      if (kind === "retry" && this.maxDelayRetries >= this.config.maxRetriesAtMaxDelay) {
+      if (
+        kind === "retry" &&
+        this.config.maxRetriesAtMaxDelay > 0 &&
+        this.maxDelayRetries >= this.config.maxRetriesAtMaxDelay
+      ) {
         this.notify(
           ctx,
           `Retry failed ${this.config.maxRetriesAtMaxDelay} times at the maximum backoff; giving up.`,

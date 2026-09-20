@@ -14,7 +14,10 @@ import {
  * Complete retry configuration used by the extension.
  */
 export interface PiRetryConfig extends BackoffConfig {
-  /** Number of failed retries allowed after the delay reaches maxDelayMs. */
+  /**
+   * Number of failed retries allowed after the delay reaches maxDelayMs.
+   * `0` (the default) retries forever at the capped delay.
+   */
   maxRetriesAtMaxDelay: number;
   /**
    * Retry errors by omitting the failed response and continuing the same
@@ -22,6 +25,9 @@ export interface PiRetryConfig extends BackoffConfig {
    */
   messageFreeRetries: boolean;
 }
+
+/** Sentinel for `maxRetriesAtMaxDelay`: never stop retrying at the cap. */
+export const UNLIMITED_RETRIES_AT_MAX_DELAY = 0;
 
 /**
  * Optional child-session fields accepted below piRetry.subagents.
@@ -35,7 +41,7 @@ export interface PiRetrySubagentsOverride {
   maxDelayMs?: number;
   /** Child retry exponential multiplier. */
   multiplier?: number;
-  /** Failed child retries allowed at the maximum delay. */
+  /** Failed child retries allowed at the maximum delay; `0` retries forever. */
   maxRetriesAtMaxDelay?: number;
   /** Child override for message-free error retries. */
   messageFreeRetries?: boolean;
@@ -75,12 +81,13 @@ export interface PiRetrySettings {
 }
 
 /**
- * Default values preserve the extension's existing behavior while making it
- * possible to tune the schedule through settings.json.
+ * Default values retry forever at the capped delay; a transient outage should
+ * outlast the backoff schedule rather than end the turn. Settings.json can
+ * reintroduce a cutoff by setting a positive maxRetriesAtMaxDelay.
  */
 export const DEFAULT_RETRY_CONFIG: PiRetryConfig = {
   ...DEFAULT_BACKOFF_CONFIG,
-  maxRetriesAtMaxDelay: 3,
+  maxRetriesAtMaxDelay: UNLIMITED_RETRIES_AT_MAX_DELAY,
   messageFreeRetries: false,
 };
 
@@ -342,7 +349,7 @@ function resolveMainRetryConfig(
       mergedSettings,
       "maxRetriesAtMaxDelay",
       DEFAULT_RETRY_CONFIG.maxRetriesAtMaxDelay,
-      value => Number.isInteger(value) && value >= 1,
+      value => Number.isInteger(value) && value >= 0,
     ),
     messageFreeRetries: readBooleanSetting(
       mergedSettings,
@@ -421,7 +428,7 @@ export function resolvePiRetrySettings(
         mergedSubagents,
         "maxRetriesAtMaxDelay",
         main.maxRetriesAtMaxDelay,
-        value => Number.isInteger(value) && value >= 1,
+        value => Number.isInteger(value) && value >= 0,
         `${PI_RETRY_SETTINGS_KEY}.subagents.maxRetriesAtMaxDelay`,
       ),
       messageFreeRetries: readBooleanSetting(

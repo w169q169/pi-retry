@@ -533,8 +533,180 @@ describe("smoke: built-in retry exhaustion", () => {
   });
 });
 
+describe("smoke: wedged waitForIdle self-heal", () => {
+  // A hung activeRun (provider stream whose abort never fires, or an
+  // agent_end listener that never settles) must not hold the retry mutex
+  // forever: after the wait bound elapses, the loop gives up and a later
+  // error can start a fresh retry loop.
+  it("releases the mutex after a wedged wait and retries the next error", async () => {
+    const { handlers, restore } = await setup();
+    try {
+      let wedged = true;
+      const agent = await createAgentWithMessages(
+        [{ role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] }],
+        vi.fn().mockImplementation(() => {
+          agent.state.messages = [
+            { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
+          ];
+          return Promise.resolve();
+        }),
+      );
+      agent.waitForIdle = vi.fn().mockImplementation(() => (wedged
+        ? new Promise<void>(() => {})  // never settles
+        : Promise.resolve()));
+
+      // First error: the loop starts and hangs inside waitForIdle.
+      const ctx1 = createMockCtx([errorEntry("Connection error")]);
+      for (const fn of handlers["agent_end"] ?? []) {
+        void fn({ messages: [] }, ctx1);
+      }
+      await advance(3_000);
+      expect(agent.prompt).not.toHaveBeenCalled();
+
+      // The wait bound elapses; the loop gives up and releases the mutex.
+      await advance(16 * 60_000);
+
+      // The agent unwedges; a new error must be able to retry again.
+      wedged = false;
+      agent.state.messages = [
+        { role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] },
+      ];
+      const ctx2 = createMockCtx([errorEntry("Connection error")]);
+      for (const fn of handlers["agent_end"] ?? []) {
+        void fn({ messages: [] }, ctx2);
+      }
+      await advance(5_000);
+
+      expect(agent.prompt).toHaveBeenCalledTimes(1);
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe("smoke: external recovery race", () => {
+  // Another driver (e.g. the goal extension's agent_settled continuation) can
+  // run a turn during pi-retry's backoff. The stale retry must be dropped
+  // instead of sending "Retry the previous request" over a recovered turn.
+  it("skips the pending retry when another driver recovered the turn mid-backoff", async () => {
+    const { handlers, restore } = await setup();
+    try {
+      const agent = await createAgentWithMessages(
+        [{ role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] }],
+        vi.fn().mockImplementation(() => {
+          agent.state.messages = [
+            { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
+          ];
+          return Promise.resolve();
+        }),
+      );
+      const ctx = createMockCtx([errorEntry("Connection error")]);
+
+      for (const fn of handlers["agent_end"] ?? []) {
+        void fn({ messages: [] }, ctx);
+      }
+
+      // Halfway through the 2s backoff, the external driver completes a
+      // successful turn (its custom user turn + assistant answer land in the
+      // live transcript).
+      await advance(1_000);
+      agent.state.messages = [
+        { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "recovered" }] },
+      ];
+
+      await advance(10_000);
+
+      expect(agent.prompt).not.toHaveBeenCalled();
+    } finally {
+      restore();
+    }
+  });
+
+  it("keeps retrying a NEW failure that arrives mid-backoff", async () => {
+    const { handlers, restore } = await setup();
+    try {
+      let attempt = 0;
+      const agent = await createAgentWithMessages(
+        [{ role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] }],
+        vi.fn().mockImplementation(() => {
+          attempt++;
+          agent.state.messages = attempt >= 2
+            ? [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] }]
+            : [{ role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] }];
+          return Promise.resolve();
+        }),
+      );
+      const ctx = createMockCtx([errorEntry("Connection error")]);
+
+      for (const fn of handlers["agent_end"] ?? []) {
+        void fn({ messages: [] }, ctx);
+      }
+
+      // Mid-backoff the external driver's own turn fails again with a new
+      // trailing error — the loop must re-arm and retry that failure.
+      await advance(1_000);
+      agent.state.messages = [
+        { role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] },
+      ];
+
+      await advance(10_000);
+
+      expect(agent.prompt).toHaveBeenCalledTimes(1);
+    } finally {
+      restore();
+    }
+  });
+});
+
 describe("smoke: retry delay cutoff", () => {
-  it("stops after three failed retries at the maximum delay", async () => {
+  it("keeps retrying at the maximum delay by default", async () => {
+    const { handlers, restore } = await setup();
+    try {
+      let attempt = 0;
+      const agent = await createAgentWithMessages(
+        [{ role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] }],
+        vi.fn().mockImplementation(() => {
+          attempt++;
+          // Fail well past the old three-failures-at-the-cap cutoff.
+          agent.state.messages = attempt >= 12
+            ? [{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] }]
+            : [{ role: "assistant", stopReason: "error", errorMessage: "Connection error", content: [] }];
+          return Promise.resolve();
+        }),
+      );
+      const ctx = createMockCtx([errorEntry("Connection error")]);
+
+      for (const fn of handlers["agent_end"] ?? []) {
+        void fn({ messages: [] }, ctx);
+      }
+
+      // Default delays: 2s, 4s, 8s, 16s, 32s, then 60s per attempt.
+      await advance(600_000);
+
+      expect(agent.prompt).toHaveBeenCalledTimes(12);
+      expect(ctx.ui.notify).not.toHaveBeenCalledWith(
+        expect.stringContaining("giving up"),
+        "warning",
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  it("stops after the configured number of failures at the maximum delay", async () => {
+    const { DEFAULT_RETRY_CONFIG } = await import("../../src/config.ts");
+    vi.doMock("../../src/config.ts", async importOriginal => {
+      const actual = await importOriginal<typeof import("../../src/config.ts")>();
+      const pinned = { ...DEFAULT_RETRY_CONFIG, maxRetriesAtMaxDelay: 3 };
+      return {
+        ...actual,
+        // The extension seeds its per-session policy from the module default
+        // (configureSession never runs in this harness), so pin it too.
+        DEFAULT_RETRY_CONFIG: pinned,
+        loadPiRetryConfig: () => pinned,
+      };
+    });
+
     const { handlers, restore } = await setup();
     try {
       const agent = await createAgentWithMessages(
@@ -553,7 +725,7 @@ describe("smoke: retry delay cutoff", () => {
         void fn({ messages: [] }, ctx);
       }
 
-      // Default delays: 2s, 4s, 8s, 16s, 32s, then three 60s attempts.
+      // Configured delays: 2s, 4s, 8s, 16s, 32s, then three 60s attempts.
       await advance(250_000);
 
       expect(agent.prompt).toHaveBeenCalledTimes(8);
@@ -563,6 +735,7 @@ describe("smoke: retry delay cutoff", () => {
       );
     } finally {
       restore();
+      vi.doUnmock("../../src/config.ts");
     }
   });
 });

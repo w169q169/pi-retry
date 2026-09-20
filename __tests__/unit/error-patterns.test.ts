@@ -8,6 +8,7 @@ import {
   has400or413Error,
   hasCreditError,
   hasConnectionError,
+  hasOverloadedError,
   hasRetryableError,
   isNonRetryableError,
   isSilencedError,
@@ -169,6 +170,43 @@ describe('hasConnectionError', () => {
   });
 });
 
+describe('hasOverloadedError', () => {
+  const createAssistantError = (errorMessage: string): AgentMessage =>
+    ({ role: 'assistant', stopReason: 'error', errorMessage, content: [] } as unknown as AgentMessage);
+
+  const testCases = [
+    { pattern: 'Error: Error Code server_is_overloaded: Our servers are currently overloaded. Please try again later.', expected: true },
+    { pattern: 'Error Code server_is_overloaded', expected: true },
+    { pattern: 'server_is_overloaded', expected: true },
+    { pattern: 'Our servers are currently overloaded. Please try again later.', expected: true },
+    { pattern: 'The server is currently overloaded', expected: true },
+    { pattern: 'Server overloaded, retry later', expected: true },
+    { pattern: 'The engine is currently overloaded, please try again later', expected: true },
+    // False cases
+    { pattern: '400 status code (no body)', expected: false },
+    { pattern: 'Connection error', expected: false },
+    { pattern: 'Invalid API key', expected: false },
+    { pattern: 'Some random error', expected: false },
+  ];
+
+  testCases.forEach(({ pattern, expected }) => {
+    it(`${expected ? 'detects' : 'rejects'} "${pattern.slice(0, 50)}"`, () => {
+      const msg = createAssistantError(pattern);
+      expect(hasOverloadedError(msg)).toBe(expected);
+    });
+  });
+
+  it('returns false for non-error messages', () => {
+    const msg = { role: 'assistant', stopReason: 'endTurn', content: [] } as unknown as AgentMessage;
+    expect(hasOverloadedError(msg)).toBe(false);
+  });
+
+  it('returns false for user messages', () => {
+    const msg = { role: 'user', content: [{ type: 'text', text: 'test' }] } as unknown as AgentMessage;
+    expect(hasOverloadedError(msg)).toBe(false);
+  });
+});
+
 describe('isContextOverflowError', () => {
   const createAssistantError = (errorMessage: string): AgentMessage =>
     ({ role: 'assistant', stopReason: 'error', errorMessage, content: [] } as unknown as AgentMessage);
@@ -250,6 +288,22 @@ describe('hasRetryableError', () => {
   it('returns true for any generic error by default', () => {
     const msg = createAssistantError('Something went wrong');
     expect(hasRetryableError(msg)).toBe(true);
+  });
+
+  // OpenAI-completions timeout shapes: a remote model that never responds
+  // (SDK timeout / undici headers timeout) or an unreachable host (SDK
+  // APIConnectionError / undici connect timeout) must stay retryable.
+  it.each([
+    'Connection error.',
+    'Error: Connection error.',
+    'Request timed out.',
+    'Connect Timeout Error (2000ms)',
+    'Headers Timeout Error',
+    'fetch failed',
+  ])('retries the openai-completions timeout shape "%s"', (pattern) => {
+    const msg = createAssistantError(pattern);
+    expect(hasRetryableError(msg)).toBe(true);
+    expect(isNonRetryableError(msg)).toBe(false);
   });
 
   it('returns true for stream exhaustion errors', () => {
@@ -356,6 +410,8 @@ describe('getErrorCategory', () => {
     expect(getErrorCategory('Rate limit exceeded')).toBe('builtin');
     expect(getErrorCategory('Server overloaded')).toBe('builtin');
     expect(getErrorCategory('500 Internal Server Error')).toBe('builtin');
+    expect(getErrorCategory('Error: Error Code server_is_overloaded: Our servers are currently overloaded. Please try again later.')).toBe('builtin');
+    expect(getErrorCategory('server_is_overloaded')).toBe('builtin');
   });
 
   it('categorizes other errors', () => {

@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   DEFAULT_RETRY_CONFIG,
+  UNLIMITED_RETRIES_AT_MAX_DELAY,
   loadPiRetryConfig,
   loadPiRetrySettings,
   resolvePiRetryConfig,
@@ -69,7 +70,7 @@ describe("resolvePiRetrySettings", () => {
       baseDelayMs: 25,
       maxDelayMs: 500,
       multiplier: 2,
-      maxRetriesAtMaxDelay: 3,
+      maxRetriesAtMaxDelay: UNLIMITED_RETRIES_AT_MAX_DELAY,
       messageFreeRetries: false,
     });
     expect(settings.subagents).toEqual({
@@ -348,6 +349,19 @@ describe("resolvePiRetryConfig", () => {
     });
   });
 
+  it("defaults to unlimited retries at the maximum delay", () => {
+    expect(DEFAULT_RETRY_CONFIG.maxRetriesAtMaxDelay).toBe(0);
+  });
+
+  it("keeps an explicit zero so retries never stop at the cap", () => {
+    const config = resolvePiRetryConfig(
+      { piRetry: { maxRetriesAtMaxDelay: 5 } },
+      { piRetry: { maxRetriesAtMaxDelay: 0 } },
+    );
+
+    expect(config.maxRetriesAtMaxDelay).toBe(0);
+  });
+
   it("falls back per field when a setting is invalid", () => {
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
@@ -357,7 +371,7 @@ describe("resolvePiRetryConfig", () => {
           baseDelayMs: -1,
           maxDelayMs: "one hour",
           multiplier: 0,
-          maxRetriesAtMaxDelay: 1.5,
+          maxRetriesAtMaxDelay: -1,
         },
       },
       {},
